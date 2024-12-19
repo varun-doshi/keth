@@ -11,6 +11,7 @@ from starkware.cairo.common.memcpy import memcpy
 from src.model import model
 from src.state import State, Internals
 from src.account import Account
+from src.constants import Constants
 
 func test__init__should_return_state_with_default_dicts() {
     // When
@@ -264,4 +265,44 @@ func test__is_storage_warm__should_return_false_when_not_accessed{
     // Then
     assert result = 0;
     return ();
+}
+
+func test__add_transfer_should_return_false_when_overflowing_recipient_balance{
+    pedersen_ptr: HashBuiltin*, range_check_ptr
+}() {
+    alloc_locals;
+    let state = State.init();
+    let (code) = alloc();
+    tempvar code_hash = new Uint256(Constants.EMPTY_CODE_HASH_LOW, Constants.EMPTY_CODE_HASH_HIGH);
+
+    // Sender
+    tempvar sender = 0x10001;
+    tempvar balanceSender = new Uint256(2 ** 128 - 1, 2 ** 128 - 1);
+    let accountSender = Account.init(0, code, code_hash, 1, balanceSender);
+
+    // Recipient
+    tempvar recipient = 0x10002;
+    tempvar balanceRecipient = new Uint256(2, 0);
+    let accountRecipient = Account.init(0, code, code_hash, 1, balanceRecipient);
+
+    // Tran
+    with state {
+        State.update_account(sender, accountSender);
+        State.update_account(recipient, accountRecipient);
+        tempvar transfer = model.Transfer(sender, recipient, [balanceSender]);
+        let result = State.add_transfer(transfer);
+    }
+    assert result = 0;
+    return ();
+}
+
+func test__get_account(evm_address: felt) -> model.Account* {
+    alloc_locals;
+    local state: model.State*;
+    %{ state %}
+    with state {
+        let account = State.get_account(evm_address);
+    }
+
+    return account;
 }

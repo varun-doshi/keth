@@ -168,7 +168,7 @@ namespace SystemOperations {
             is_create=TRUE,
             depth=evm.message.depth + 1,
             env=evm.message.env,
-            cairo_precompile_called=evm.message.cairo_precompile_called,
+            initial_state=evm.message.initial_state,
         );
         let child_evm = EVM.init(message, gas_limit);
         let stack = Stack.init();
@@ -180,10 +180,9 @@ namespace SystemOperations {
 
         let transfer = model.Transfer(evm.message.address, target_address, [value]);
         let success = State.add_transfer(transfer);
-        if (success == 0) {
-            Stack.push_uint128(0);
-            return child_evm;
-        }
+
+        // @dev: This transfer cannot fail, as the balance was checked before.
+        State.add_transfer(transfer);
 
         return child_evm;
     }
@@ -815,9 +814,9 @@ namespace SystemOperations {
 
         // If the account was created in the same transaction and recipient is self, the native token is burnt
         tempvar is_recipient_not_self = is_not_zero(recipient - evm.message.address);
-
         if (self_account.created != FALSE) {
-            tempvar recipient = is_recipient_not_self * recipient;
+            tempvar recipient = (1 - is_recipient_not_self) * Constants.BURN_ADDRESS +
+                is_recipient_not_self * recipient;
         } else {
             tempvar recipient = recipient;
         }
@@ -894,6 +893,10 @@ namespace CallHelper {
         let stack = Stack.init();
         let memory = Memory.init();
 
+        let (valid_jumpdests_start, valid_jumpdests) = Helpers.initialize_jumpdests(
+            bytecode_len=code_len, bytecode=code
+        );
+
         if (is_staticcall != FALSE) {
             tempvar read_only = TRUE;
         } else {
@@ -903,8 +906,8 @@ namespace CallHelper {
         tempvar message = new model.Message(
             bytecode=code,
             bytecode_len=code_len,
-            valid_jumpdests_start=code_account.valid_jumpdests_start,
-            valid_jumpdests=code_account.valid_jumpdests,
+            valid_jumpdests_start=valid_jumpdests_start,
+            valid_jumpdests=valid_jumpdests,
             calldata=calldata,
             calldata_len=args_size.low,
             value=value,
@@ -916,7 +919,7 @@ namespace CallHelper {
             is_create=FALSE,
             depth=evm.message.depth + 1,
             env=evm.message.env,
-            cairo_precompile_called=evm.message.cairo_precompile_called,
+            initial_state=evm.message.initial_state,
         );
 
         let child_evm = EVM.init(message, gas);
@@ -955,9 +958,6 @@ namespace CallHelper {
         }
         let state = cast([ap - 1], model.State*);
 
-        let cairo_precompile_called = evm.message.cairo_precompile_called +
-            evm.message.parent.evm.message.cairo_precompile_called;
-
         tempvar message = new model.Message(
             bytecode=evm.message.parent.evm.message.bytecode,
             bytecode_len=evm.message.parent.evm.message.bytecode_len,
@@ -974,19 +974,11 @@ namespace CallHelper {
             is_create=evm.message.parent.evm.message.is_create,
             depth=evm.message.parent.evm.message.depth,
             env=evm.message.parent.evm.message.env,
-            cairo_precompile_called=cairo_precompile_called,
+            initial_state=evm.message.initial_state,
         );
 
-        if (evm.reverted != FALSE) {
-            // If a call to a cairo precompile has been made, the tx should be reverted
-            with_attr error_message(
-                    "EVM tx reverted, reverting SN tx because of previous calls to cairo precompiles") {
-                assert cairo_precompile_called = FALSE;
-            }
-        }
-
         if (evm.reverted == Errors.EXCEPTIONAL_HALT) {
-            // If the call has halted exceptionnaly, the return_data is empty
+            // If the call has halted exceptionally, the return_data is empty
             // and nothing is copied to memory, and the gas is not returned;
             tempvar evm = new model.EVM(
                 message=message,
@@ -1156,9 +1148,6 @@ namespace CreateHelper {
     }(evm: model.EVM*) -> model.EVM* {
         alloc_locals;
 
-        let cairo_precompile_called = evm.message.cairo_precompile_called +
-            evm.message.parent.evm.message.cairo_precompile_called;
-
         tempvar message = new model.Message(
             bytecode=evm.message.parent.evm.message.bytecode,
             bytecode_len=evm.message.parent.evm.message.bytecode_len,
@@ -1175,14 +1164,10 @@ namespace CreateHelper {
             is_create=evm.message.parent.evm.message.is_create,
             depth=evm.message.parent.evm.message.depth,
             env=evm.message.parent.evm.message.env,
-            cairo_precompile_called=cairo_precompile_called,
+            initial_state=evm.message.initial_state,
         );
         // Reverted during execution - either REVERT or exceptional
         if (evm.reverted != FALSE) {
-            with_attr error_message(
-                    "EVM tx reverted, reverting SN tx because of previous calls to cairo precompiles") {
-                assert cairo_precompile_called = FALSE;
-            }
             let is_exceptional_revert = is_not_zero(Errors.REVERT - evm.reverted);
             let return_data_len = (1 - is_exceptional_revert) * evm.return_data_len;
             let gas_left = evm.message.parent.evm.gas_left + (1 - is_exceptional_revert) *
@@ -1229,10 +1214,6 @@ namespace CreateHelper {
 
         if (success == FALSE) {
             tempvar state = evm.message.parent.state;
-            with_attr error_message(
-                    "EVM tx reverted, reverting SN tx because of previous calls to cairo precompiles") {
-                assert cairo_precompile_called = FALSE;
-            }
 
             tempvar evm = new model.EVM(
                 message=message,

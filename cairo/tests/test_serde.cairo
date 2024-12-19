@@ -1,10 +1,6 @@
-from ethereum.base_types import (
-    None,
-    bool,
-    U64,
-    U128,
-    U256,
-    Uint,
+from ethereum_types.numeric import bool, U64, U128, U256, Uint
+from ethereum_types.others import None
+from ethereum_types.bytes import (
     Bytes0,
     Bytes8,
     Bytes20,
@@ -13,6 +9,7 @@ from ethereum.base_types import (
     Bytes,
     TupleBytes,
     TupleBytes32,
+    MappingBytesBytes,
 )
 
 from ethereum.cancun.fork_types import Address, Root, VersionedHash, Bloom, Account
@@ -39,3 +36,4 @@ from ethereum.cancun.transactions import (
 from ethereum.cancun.vm.gas import MessageCallGas
 
 from ethereum.cancun.trie import BranchNode, ExtensionNode, InternalNode, LeafNode, Node
+from ethereum.exceptions import EthereumException

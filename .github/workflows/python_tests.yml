@@ -10,28 +10,45 @@ jobs:
     name: Python
     runs-on: ubuntu-latest-64-cores
     env:
+      PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
       HYPOTHESIS_PROFILE: ci
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: ./cairo/.python-version
+
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
 
-      - name: Run tests
-        env:
-          PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+      - name: Install forge deps
+        run: forge install
+
+      - name: Build solidity contracts
+        run: forge build
+
+      - name: Restore pytest cache
+        id: cache-pytest-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: cairo/.pytest_cache
+          key: ${{ runner.os }}-pytest-cache-${{ github.run_id }}
+          restore-keys: ${{ runner.os }}-pytest-cache-
+
+      - name: Run tests with caching
         run: |
           cd cairo
-          uv run compile
-          forge build
-          uv run pytest -n logical --junitxml=junit.xml -o junit_family=legacy
-      - uses: codecov/codecov-action@v5.0.5
+          uv run compile_os
+          uv run pytest tests -n logical --durations=0 -v
+
+      - uses: actions/cache/save@v4
         with:
-          directory: ./cairo/coverage/
-      - uses: codecov/test-results-action@v1
-        if: ${{ !cancelled() }}
+          path: cairo/.pytest_cache
+          key: ${{ runner.os }}-pytest-cache-${{ github.run_id }}

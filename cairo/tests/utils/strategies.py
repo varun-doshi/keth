@@ -4,25 +4,18 @@ from dataclasses import fields
 from typing import ForwardRef, Sequence, TypeAlias, Union
 from unittest.mock import patch
 
+from eth_keys.datatypes import PrivateKey
+from ethereum_types.bytes import Bytes0, Bytes8, Bytes20, Bytes32, Bytes256
+from ethereum_types.numeric import U64, U256, FixedUnsigned, Uint
 from hypothesis import strategies as st
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 
-from ethereum.base_types import (
-    U64,
-    U256,
-    Bytes0,
-    Bytes8,
-    Bytes20,
-    Bytes32,
-    Bytes256,
-    FixedUint,
-    Uint,
-)
+from ethereum.crypto.elliptic_curve import SECP256K1N
 
 # Mock the Extended type because hypothesis cannot handle the RLP Protocol
 # Needs to be done before importing the types from ethereum.cancun.trie
 # trunk-ignore(ruff/F821)
-MockExtended: TypeAlias = Union[Sequence["Extended"], bytearray, bytes, Uint, FixedUint, str, bool]  # type: ignore
+MockExtended: TypeAlias = Union[Sequence["Extended"], bytearray, bytes, Uint, FixedUnsigned, str, bool]  # type: ignore
 patch("ethereum.rlp.Extended", MockExtended).start()
 
 from ethereum.cancun.blocks import Header, Log, Receipt, Withdrawal
@@ -47,7 +40,7 @@ uint = uint64.map(Uint)
 uint128 = st.integers(min_value=0, max_value=2**128 - 1)
 felt = st.integers(min_value=0, max_value=DEFAULT_PRIME - 1)
 uint256 = st.integers(min_value=0, max_value=2**256 - 1).map(U256)
-nibble = st.lists(uint4).map(bytes)
+nibble = st.lists(uint4, max_size=64).map(bytes)
 
 bytes0 = st.binary(min_size=0, max_size=0).map(Bytes0)
 bytes8 = st.binary(min_size=8, max_size=8).map(Bytes8)
@@ -101,11 +94,17 @@ state = st.lists(bytes20).flatmap(
     )
 )
 
+private_key = (
+    st.integers(min_value=1, max_value=int(SECP256K1N) - 1)
+    .map(lambda x: int.to_bytes(x, 32, "big"))
+    .map(PrivateKey)
+)
+
 
 def register_type_strategies():
     st.register_type_strategy(U64, uint64)
     st.register_type_strategy(Uint, uint)
-    st.register_type_strategy(FixedUint, uint)
+    st.register_type_strategy(FixedUnsigned, uint)
     st.register_type_strategy(U256, uint256)
     st.register_type_strategy(Bytes0, bytes0)
     st.register_type_strategy(Bytes8, bytes8)
@@ -132,15 +131,29 @@ def register_type_strategies():
     # See https://github.com/ethereum/execution-specs/issues/1043
     st.register_type_strategy(
         LeafNode,
-        st.fixed_dictionaries({"rest_of_key": nibble, "value": extended}).map(
-            lambda x: LeafNode(**x)
-        ),
+        st.fixed_dictionaries(
+            # Value is either storage value or RLP encoded account
+            {"rest_of_key": nibble, "value": st.binary(max_size=32 * 4)}
+        ).map(lambda x: LeafNode(**x)),
     )
     # See https://github.com/ethereum/execution-specs/issues/1043
     st.register_type_strategy(
         ExtensionNode,
-        st.fixed_dictionaries({"key_segment": nibble, "subnode": extended}).map(
-            lambda x: ExtensionNode(**x)
-        ),
+        st.fixed_dictionaries(
+            {"key_segment": nibble, "subnode": st.binary(min_size=32, max_size=32)}
+        ).map(lambda x: ExtensionNode(**x)),
     )
-    st.register_type_strategy(BranchNode, st_from_type(BranchNode))
+    st.register_type_strategy(
+        BranchNode,
+        st.fixed_dictionaries(
+            {
+                # 16 subnodes of 32 bytes each
+                "subnodes": st.lists(
+                    st.binary(min_size=32, max_size=32), min_size=16, max_size=16
+                ),
+                # Value in branch nodes is always empty
+                "value": st.just(b""),
+            }
+        ).map(lambda x: BranchNode(**x)),
+    )
+    st.register_type_strategy(PrivateKey, private_key)

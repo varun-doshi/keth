@@ -11,7 +11,6 @@ from starkware.cairo.lang.vm.relocatable import MaybeRelocatable
 
 from ethereum.cancun.vm.instructions import Ops
 from tests.utils.args_gen import to_cairo_type
-from tests.utils.constants import CHAIN_ID
 from tests.utils.helpers import flatten
 
 
@@ -41,8 +40,8 @@ def gen_arg_pydantic(
     To be removed once all models are removed in favor of eels types.
     """
     if isinstance(arg, Dict):
-        base = segments.add()
-        assert base.segment_index not in dict_manager.trackers
+        dict_ptr = segments.add()
+        assert dict_ptr.segment_index not in dict_manager.trackers
 
         data = {
             k: gen_arg_pydantic(dict_manager, segments, v, apply_modulo_to_args)
@@ -51,13 +50,16 @@ def gen_arg_pydantic(
         if isinstance(arg, defaultdict):
             data = defaultdict(arg.default_factory, data)
 
-        dict_manager.trackers[base.segment_index] = DictTracker(
-            data=data, current_ptr=base
+        # This is required for tests where we read data from DictAccess segments while no dict method has been used.
+        # Equivalent to doing an initial dict_read of all keys.
+        initial_data = flatten([(k, v, v) for k, v in data.items()])
+        segments.load_data(dict_ptr, initial_data)
+        current_ptr = dict_ptr + len(initial_data)
+        dict_manager.trackers[dict_ptr.segment_index] = DictTracker(
+            data=data, current_ptr=current_ptr
         )
 
-        # In case of a dict, it's assumed that the struct **always** have consecutive dict_start, dict_ptr
-        # fields.
-        return base, base
+        return dict_ptr, current_ptr
 
     if isinstance(arg, Iterable):
         base = segments.add()
@@ -81,118 +83,100 @@ def gen_arg_pydantic(
     return arg
 
 
-dict_manager = """
-if '__dict_manager' not in globals():
-    from starkware.cairo.common.dict import DictManager
-    __dict_manager = DictManager()
-"""
-
-dict_copy = """
-from starkware.cairo.common.dict import DictTracker
-
-data = __dict_manager.trackers[ids.dict_start.address_.segment_index].data.copy()
-__dict_manager.trackers[ids.new_start.address_.segment_index] = DictTracker(
-    data=data,
-    current_ptr=ids.new_end.address_,
-)
-"""
-
-dict_squash = """
-from starkware.cairo.common.dict import DictTracker
-
-data = __dict_manager.get_dict(ids.dict_accesses_end).copy()
-base = segments.add()
-assert base.segment_index not in __dict_manager.trackers
-__dict_manager.trackers[base.segment_index] = DictTracker(
-    data=data, current_ptr=base
-)
-memory[ap] = base
-"""
-
-block = f"""
-{dict_manager}
-from tests.utils.hints import gen_arg_pydantic
-
-ids.block = gen_arg_pydantic(__dict_manager, segments, program_input["block"])
-"""
-
-state = f"""
-{dict_manager}
-from tests.utils.hints import gen_arg_pydantic
-
-ids.state = gen_arg_pydantic(__dict_manager, segments, program_input["state"])
-"""
-
-chain_id = f"""
-ids.chain_id = {CHAIN_ID}
-"""
-
-block_hashes = """
-import random
-
-ids.block_hashes = segments.gen_arg([random.randint(0, 2**128 - 1) for _ in range(256 * 2)])
-"""
-
-
-hints = {
-    "dict_manager": dict_manager,
-    "dict_copy": dict_copy,
-    "dict_squash": dict_squash,
-    "block": block,
-    "state": state,
-    "chain_id": chain_id,
-    "block_hashes": block_hashes,
-}
-
-
-def implement_hints(program):
-    return {
-        k: [
-            (
-                CairoHint(
-                    accessible_scopes=hint_.accessible_scopes,
-                    flow_tracking_data=hint_.flow_tracking_data,
-                    code=hints.get(hint_.code, hint_.code),
-                )
-            )
-            for hint_ in v
-        ]
-        for k, v in program.hints.items()
-    }
-
-
 @contextmanager
-def patch_hint(program, hint, new_hint, scope: Optional[str] = None):
+def patch_hint(program, hint: str, new_hint: str, scope: Optional[str] = None):
     """
-    Patch a Cairo hint in a program with a new hint.
+    Temporarily patches a Cairo hint in a program with a new hint code.
+
+    This function can handle two types of hints:
+    1. Nondet hints in the format: 'nondet %{arg%};'
+    2. Regular hints with arbitrary code
+
+    When patching nondet hints, the function will automatically look for the memory assignment
+    pattern 'memory[fp + <i>] = to_felt_or_relocatable(arg)' and replace the argument.
+
     Args:
-        program: The Cairo program containing the hints
-        hint: The original hint code to replace
-        new_hint: The new hint code to use instead
+        program: The Cairo program containing the hints to patch
+        hint: The original hint code to replace. Can be either a regular hint or a nondet hint.
+        new_hint: The new hint code to use. For nondet hints, this should be a new nondet hint.
         scope: Optional scope name to restrict which hints are patched. If provided,
-              only hints in scope containing this string will be patched.
+               only hints within matching scopes will be modified
+
+    Raises:
+        ValueError: If the specified hint is not found in the program
+
     Example:
-        with patch_hint(program, "old_hint", "new_hint", "initialize_jumpdests"):
-            # Code that runs with the patched hint
+        # Replace a nondet hint
+        with patch_hint(program, 'nondet %{x%};', 'nondet %{y%};'):
+            ...
+
+        # Replace a regular hint
+        with patch_hint(program, 'ids.x = 5', 'ids.x = 10'):
+            ...
+
+        # Replace hint only in specific scope
+        with patch_hint(program, 'ids.x = 5', 'ids.x = 10', scope='my_function'):
+            ...
     """
-    patched_hints = {
-        k: [
-            (
-                hint_
-                if hint_.code != hint
-                or (scope is not None and scope not in str(hint_.accessible_scopes[-1]))
-                else CairoHint(
-                    accessible_scopes=hint_.accessible_scopes,
-                    flow_tracking_data=hint_.flow_tracking_data,
-                    code=new_hint,
-                )
-            )
-            for hint_ in v
-        ]
-        for k, v in program.hints.items()
-    }
+    import re
+
+    def get_nondet_arg(hint_code: str) -> Optional[str]:
+        """Extract argument from nondet hint if it is one, otherwise return None."""
+        if match := re.match(r"nondet %{(.+)%};", hint_code.strip()):
+            return match.group(1).strip()
+        return None
+
+    def parse_fp_assignment_hint(hint_code: str) -> tuple[Optional[str], Optional[str]]:
+        """Extract memory location and argument from an fp assignment hint."""
+        if match := re.match(
+            r"memory\[(.+)\] = to_felt_or_relocatable\((.+)\)", hint_code
+        ):
+            return match.group(1), match.group(2).strip()
+        return None, None
+
+    # Determine if we're dealing with nondet hints
+    orig_nondet_arg = get_nondet_arg(hint)
+    new_nondet_arg = get_nondet_arg(new_hint)
+
+    patched_hints = {}
+    for k, hint_list in program.hints.items():
+        new_hints = []
+        for hint_ in hint_list:
+            # Skip hints not in specified scope
+            if scope is not None and scope not in str(hint_.accessible_scopes[-1]):
+                new_hints.append(hint_)
+                continue
+
+            if orig_nondet_arg:
+                # Handle nondet hint patching
+                mem_loc, arg = parse_fp_assignment_hint(hint_.code)
+                if arg == orig_nondet_arg:
+                    new_hints.append(
+                        CairoHint(
+                            accessible_scopes=hint_.accessible_scopes,
+                            flow_tracking_data=hint_.flow_tracking_data,
+                            code=f"memory[{mem_loc}] = to_felt_or_relocatable({new_nondet_arg})",
+                        )
+                    )
+                else:
+                    new_hints.append(hint_)
+            else:
+                # Handle regular hint patching
+                if hint_.code.strip() == hint.strip():
+                    new_hints.append(
+                        CairoHint(
+                            accessible_scopes=hint_.accessible_scopes,
+                            flow_tracking_data=hint_.flow_tracking_data,
+                            code=new_hint,
+                        )
+                    )
+                else:
+                    new_hints.append(hint_)
+        patched_hints[k] = new_hints
+
     if patched_hints == program.hints:
         raise ValueError(f"Hint\n\n{hint}\n\nnot found in program hints.")
+
     with patch.object(program, "hints", new=patched_hints):
         yield
 

@@ -123,7 +123,7 @@ namespace model {
         is_create: felt,
         depth: felt,
         env: Environment*,
-        cairo_precompile_called: felt,
+        initial_state: State*,
     }
 
     // @dev Stores all data relevant to the current execution context.
@@ -168,6 +168,7 @@ namespace model {
         coinbase: felt,
         base_fee: felt,
         block_hashes: Uint256*,
+        excess_blob_gas: Option,
     }
 
     // @dev The parent EVM struct is used to store the parent EVM context of the current execution context.

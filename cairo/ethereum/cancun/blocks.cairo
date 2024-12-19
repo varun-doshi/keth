@@ -1,14 +1,5 @@
-from ethereum.base_types import (
-    U64,
-    U256,
-    Bytes,
-    Bytes8,
-    Bytes32,
-    Uint,
-    TupleBytes32,
-    bool,
-    TupleBytes,
-)
+from ethereum_types.numeric import U64, U256, Uint, bool
+from ethereum_types.bytes import Bytes, Bytes8, Bytes32, TupleBytes, TupleBytes32
 from ethereum.cancun.fork_types import Address, Bloom, Root
 from ethereum.crypto.hash import Hash32
 
@@ -24,7 +15,7 @@ struct Withdrawal {
 }
 
 struct TupleWithdrawalStruct {
-    value: Withdrawal*,
+    data: Withdrawal*,
     len: felt,
 }
 
@@ -60,7 +51,7 @@ struct Header {
 }
 
 struct TupleHeaderStruct {
-    value: Header*,
+    data: Header*,
     len: felt,
 }
 
@@ -79,7 +70,7 @@ struct Log {
 }
 
 struct TupleLogStruct {
-    value: Log*,
+    data: Log*,
     len: felt,
 }
 

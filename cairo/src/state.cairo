@@ -14,6 +14,7 @@ from src.gas import Gas
 from src.utils.dict import dict_copy, dict_squash
 from src.utils.utils import Helpers
 from src.utils.uint256 import uint256_add, uint256_sub, uint256_eq
+from src.constants import Constants
 
 namespace State {
     // @dev Create a new empty State
@@ -75,7 +76,21 @@ namespace State {
         local accounts: DictAccess* = state.accounts;
         let (pointer) = dict_read{dict_ptr=accounts}(key=evm_address);
 
-        let account = cast(pointer, model.Account*);
+        // Return from state if found
+        if (pointer != 0) {
+            let account = cast(pointer, model.Account*);
+            tempvar state = new model.State(
+                accounts_start=state.accounts_start,
+                accounts=accounts,
+                events_len=state.events_len,
+                events=state.events,
+            );
+            return account;
+        }
+
+        // Initialize a new account, empty otherwise
+        let account = Account.default();
+        dict_write{dict_ptr=accounts}(key=evm_address, new_value=cast(account, felt));
         tempvar state = new model.State(
             accounts_start=state.accounts_start,
             accounts=accounts,
@@ -317,6 +332,10 @@ namespace State {
         let (local recipient_balance_new, carry) = uint256_add(
             [recipient.balance], transfer.amount
         );
+
+        if (carry != 0) {
+            return 0;
+        }
 
         let sender = Account.set_balance(sender, &sender_balance_new);
         let recipient = Account.set_balance(recipient, &recipient_balance_new);

@@ -1,16 +1,51 @@
-from collections.abc import Sequence as ABCSequence
+"""
+Cairo Type System Serialization/Deserialization
+
+This module implements the serialization of Cairo types to Python types.
+It is part of the "soft type system" that allows seamless conversion between Python and Cairo,
+and mirrors @args_gen.py.
+
+The serialization process is based on the Cairo type system rules defined in @args_gen.py.
+Given a Cairo type, we know what the memory layout is, and how to retrieve individual values from the memory.
+
+For example, a Union type is represented as a struct with a pointer to the memory segment of the
+variant.  The only value that is not a `0` is the pointer to the memory segment of the variant.
+Thus, when deserializing a Union type, we first get the pointer to the variant struct, then check
+which member has a non-zero pointer value. This non-zero pointer indicates which variant is actually
+present, and points to the memory segment containing that variant's data. If we find more or less
+than exactly one non-zero pointer, it means the Union is malformed.
+Once we have the variant pointer, we can deserialize the variant by recursively calling the
+serialization function.
+"""
+
+from collections import abc
 from inspect import signature
+from itertools import accumulate
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple, Union, get_args, get_origin
+from typing import (
+    Any,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    get_args,
+    get_origin,
+)
 
 from eth_utils.address import to_checksum_address
+from ethereum_types.bytes import Bytes, Bytes0, Bytes8, Bytes20, Bytes32, Bytes256
+from ethereum_types.numeric import U256
 from starkware.cairo.lang.compiler.ast.cairo_types import (
+    CairoType,
     TypeFelt,
     TypePointer,
     TypeStruct,
     TypeTuple,
 )
 from starkware.cairo.lang.compiler.identifier_definition import (
+    AliasDefinition,
     StructDefinition,
     TypeDefinition,
 )
@@ -18,12 +53,20 @@ from starkware.cairo.lang.compiler.identifier_manager import MissingIdentifierEr
 from starkware.cairo.lang.compiler.scoped_name import ScopedName
 from starkware.cairo.lang.vm.memory_segments import MemorySegmentManager
 
-from ethereum.base_types import U256, Bytes, Bytes0, Bytes8, Bytes20, Bytes32, Bytes256
 from ethereum.crypto.hash import Hash32
 from tests.utils.args_gen import to_python_type
 
+# Sentinel object for indicating no error in exception handling
+NO_ERROR_FLAG = object()
+
 
 def get_struct_definition(program, path: Tuple[str, ...]) -> StructDefinition:
+    """
+    Resolves and returns the struct definition for a given path in the Cairo program.
+    If the path is an alias (`import T from ...`), it resolves the alias to the actual struct definition.
+    If the path is a type definition `using T = V`, it resolves the type definition to the actual struct definition.
+    Otherwise, it returns the struct definition directly.
+    """
     scope = ScopedName(path)
     identifier = program.identifiers.as_dict()[scope]
     if isinstance(identifier, StructDefinition):
@@ -32,6 +75,9 @@ def get_struct_definition(program, path: Tuple[str, ...]) -> StructDefinition:
         identifier.cairo_type, TypeStruct
     ):
         return get_struct_definition(program, identifier.cairo_type.scope.path)
+    if isinstance(identifier, AliasDefinition):
+        destination = identifier.destination.path
+        return get_struct_definition(program, destination)
     raise ValueError(f"Expected a struct named {path}, found {identifier}")
 
 
@@ -69,6 +115,7 @@ class Serde:
         """
         Recursively serialize a Cairo instance, returning the corresponding Python instance.
         """
+
         if ptr == 0:
             return None
 
@@ -79,6 +126,8 @@ class Serde:
 
         if get_origin(python_cls) is Union:
             value_ptr = self.serialize_pointers(path, ptr)["value"]
+            if value_ptr is None:
+                return None
             value_path = (
                 get_struct_definition(self.program, path)
                 .members["value"]
@@ -101,7 +150,7 @@ class Serde:
 
             return self._serialize(variant.cairo_type, value_ptr + variant.offset)
 
-        if get_origin(python_cls) in (tuple, list, Sequence, ABCSequence):
+        if get_origin(python_cls) in (tuple, list, Sequence, abc.Sequence):
             # Tuple and list are represented as structs with a pointer to the first element and the length.
             # The value field is a list of Relocatable (pointers to each element) or Felt (tuple of felts).
             # In usual cairo, a pointer to a struct, (e.g. Uint256*) is actually a pointer to one single
@@ -123,18 +172,52 @@ class Serde:
             else:
                 # These are tuples with a variable size (or list or sequences).
                 raw = self.serialize_pointers(tuple_struct_path, tuple_struct_ptr)
-                tuple_item_path = members["value"].cairo_type.pointee.scope.path
+                tuple_item_path = members["data"].cairo_type.pointee.scope.path
                 resolved_cls = (
                     get_origin(python_cls)
-                    if get_origin(python_cls) not in (Sequence, ABCSequence)
+                    if get_origin(python_cls) not in (Sequence, abc.Sequence)
                     else list
                 )
                 return resolved_cls(
                     [
-                        self.serialize_type(tuple_item_path, raw["value"] + i)
+                        self.serialize_type(tuple_item_path, raw["data"] + i)
                         for i in range(raw["len"])
                     ]
                 )
+
+        if get_origin(python_cls) in (Mapping, abc.Mapping, set):
+            mapping_struct_ptr = self.serialize_pointers(path, ptr)["value"]
+            mapping_struct_path = (
+                get_struct_definition(self.program, path)
+                .members["value"]
+                .cairo_type.pointee.scope.path
+            )
+            dict_access_path = (
+                get_struct_definition(self.program, mapping_struct_path)
+                .members["dict_ptr"]
+                .cairo_type.pointee.scope.path
+            )
+            dict_access_types = get_struct_definition(
+                self.program, dict_access_path
+            ).members
+            key_type = dict_access_types["key"].cairo_type
+            value_type = dict_access_types["new_value"].cairo_type
+            pointers = self.serialize_pointers(mapping_struct_path, mapping_struct_ptr)
+            segment_size = pointers["dict_ptr"] - pointers["dict_ptr_start"]
+            dict_ptr = pointers["dict_ptr_start"]
+
+            if get_origin(python_cls) is set:
+                return {
+                    self._serialize(key_type, dict_ptr + i)
+                    for i in range(0, segment_size, 3)
+                }
+
+            return {
+                self._serialize(key_type, dict_ptr + i): self._serialize(
+                    value_type, dict_ptr + i + 2
+                )
+                for i in range(0, segment_size, 3)
+            }
 
         if python_cls in (bytes, bytearray, Bytes, str):
             tuple_struct_ptr = self.serialize_pointers(path, ptr)["value"]
@@ -145,6 +228,21 @@ class Serde:
             if python_cls is str:
                 return bytes(data).decode()
             return python_cls(data)
+
+        if python_cls and issubclass(python_cls, Exception):
+            tuple_struct_ptr = self.serialize_pointers(path, ptr)["value"]
+            if not tuple_struct_ptr:
+                return NO_ERROR_FLAG
+            struct_name = (
+                get_struct_definition(self.program, path)
+                .members["value"]
+                .cairo_type.pointee.scope.path[-1]
+            )
+            path = (*path[:-1], struct_name)
+            raw = self.serialize_pointers(path, tuple_struct_ptr)
+            data = [self.memory.get(raw["data"] + i) for i in range(raw["len"])]
+            error_message = bytes(data).decode() or ""
+            raise python_cls(error_message)
 
         if python_cls == Bytes256:
             base_ptr = self.memory.get(ptr)
@@ -235,10 +333,12 @@ class Serde:
                 return serialized[0]
             return serialized
         if isinstance(cairo_type, TypeTuple):
-            return [
+            raw = [
                 self._serialize(m.typ, ptr + i)
                 for i, m in enumerate(cairo_type.members)
             ]
+            filtered = [x for x in raw if x is not NO_ERROR_FLAG]
+            return filtered[0] if len(filtered) == 1 else filtered
         if isinstance(cairo_type, TypeFelt):
             return self.memory.get(ptr)
         if isinstance(cairo_type, TypeStruct):
@@ -254,6 +354,11 @@ class Serde:
                 return len(identifier.members)
             except (ValueError, AttributeError):
                 return 1
+
+    def get_offsets(self, cairo_types: List[CairoType]):
+        """Given a list of Cairo types, return the cumulative offset for each type."""
+        offsets = [self.get_offset(t) for t in reversed(cairo_types)]
+        return list(reversed(list(accumulate(offsets))))
 
     def serialize(self, cairo_type, base_ptr, shift=None, length=None):
         shift = shift if shift is not None else self.get_offset(cairo_type)

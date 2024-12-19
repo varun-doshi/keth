@@ -1,4 +1,11 @@
-from eth_abi import encode
+import json
+import logging
+from pathlib import Path
+
+import pytest
+from eth_abi.abi import encode
+from ethereum_types.numeric import U256
+from hexbytes import HexBytes
 from hypothesis import given
 from hypothesis.strategies import integers
 
@@ -8,12 +15,19 @@ from src.utils.uint256 import int_to_uint256
 from tests.utils.constants import COINBASE, OTHER, OWNER
 from tests.utils.data import block
 from tests.utils.errors import cairo_error
-from tests.utils.models import State
+from tests.utils.helpers import get_internal_storage_key
+from tests.utils.models import Block, State
 from tests.utils.solidity import get_contract
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
 class TestOs:
 
+    @pytest.mark.slow
     def test_erc20_transfer(self, cairo_run):
         erc20 = get_contract("ERC20", "KethToken")
         amount = int(1e18)
@@ -65,11 +79,76 @@ class TestOs:
         # TODO: parse the storage keys to check the values properly
         assert (
             sum(
-                [v["low"] for v in state["accounts"][erc20.address]["storage"].values()]
+                [
+                    v["low"]
+                    for k, v in state["accounts"][erc20.address]["storage"].items()
+                    if k not in [get_internal_storage_key(i) for i in range(3)]
+                ]
             )
             == amount + 2**128 - 1
         )
-        assert len(state["accounts"][erc20.address]["storage"].keys()) == 3
+        # name, symbol, totalSupply, balanceOf[OWNER], allowance[OTHER][OWNER], balanceOf[OTHER]
+        assert len(state["accounts"][erc20.address]["storage"].keys()) == 6
+
+    @pytest.mark.skip("Only for debugging")
+    @pytest.mark.slow
+    @pytest.mark.parametrize("block_number", [21389405])
+    def test_eth_block(self, cairo_run, block_number):
+        prover_input_path = Path(f"cache/{block_number}_long.json")
+        with open(prover_input_path, "r") as f:
+            prover_input = json.load(f)
+
+        transactions = [
+            tx
+            for tx in prover_input["block"]["transactions"]
+            if int(tx["type"], 16) != 3
+        ]
+        logger.info(
+            f"Number of non-blob transactions: {len(transactions)} / {len(prover_input['block']['transactions'])}"
+        )
+
+        header = prover_input["block"].copy()
+        del header["transactions"]
+        del header["withdrawals"]
+        del header["size"]
+
+        codes = {
+            keccak256(HexBytes(code)): HexBytes(code) for code in prover_input["codes"]
+        }
+        pre_state = {
+            account["address"]: {
+                "nonce": account.get("nonce", 0),
+                "balance": int(account.get("balance", 0), 16),
+                "code": list(codes.get(HexBytes(account.get("codeHash", b"")), b"")),
+                "storage": {
+                    slot["key"]: int(slot["value"], 16)
+                    for slot in account.get("storageProof", [])
+                },
+            }
+            for account in prover_input["preStateProofs"]
+        }
+
+        post_state = cairo_run(
+            "test_os",
+            block=Block.model_validate(
+                {"block_header": header, "transactions": transactions}
+            ),
+            state=State.model_validate(pre_state),
+        )
+
+        expected = {
+            account["address"]: {
+                "nonce": account.get("nonce", 0),
+                "balance": int(account.get("balance", 0), 16),
+                "code": list(codes.get(HexBytes(account.get("codeHash", b"")), b"")),
+                "storage": {
+                    slot["key"]: int(slot["value"], 16)
+                    for slot in account.get("storageProof", [])
+                },
+            }
+            for account in prover_input["postStateProofs"]
+        }
+        assert post_state == expected
 
     def test_block_hint(self, cairo_run):
         output = cairo_run("test_block_hint", block=block())
@@ -127,7 +206,11 @@ class TestOs:
             ),
         ]
 
-    @given(s_value=integers(min_value=SECP256K1N // 2 + 1, max_value=SECP256K1N))
+    @given(
+        s_value=integers(
+            min_value=int(SECP256K1N // U256(2) + U256(1)), max_value=int(SECP256K1N)
+        )
+    )
     def test_should_raise_on_invalid_s_value(self, cairo_run, s_value):
         initial_state = {
             OWNER: {
@@ -173,7 +256,7 @@ class TestOs:
             },
         }
         transaction = {
-            "to": "",
+            "to": None,
             "data": "0x604580600e600039806000f350fe7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3",
             "value": 0,
             "signer": OWNER,
@@ -184,6 +267,45 @@ class TestOs:
             state=State.model_validate(initial_state),
         )
 
-        bytes.fromhex(
-            "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3"
-        ) == state["accounts"]["0x32dCAB0EF3FB2De2fce1D2E0799D36239671F04A"]["code"]
+        assert (
+            bytes.fromhex(
+                "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3"
+            )
+            == state["accounts"]["0x32dCAB0EF3FB2De2fce1D2E0799D36239671F04A"]["code"]
+        )
+
+    @given(nonce=integers(min_value=2**64, max_value=2**248 - 1))
+    def test_should_raise_when_nonce_is_greater_u64(self, cairo_run, nonce):
+        initial_state = {
+            OWNER: {
+                "code": [],
+                "storage": {},
+                "balance": int(1e18),
+                "nonce": nonce,
+            },
+            OTHER: {
+                "code": [],
+                "storage": {},
+                "balance": int(1e18),
+                "nonce": 0,
+            },
+            COINBASE: {
+                "code": [],
+                "storage": {},
+                "balance": 0,
+                "nonce": 0,
+            },
+        }
+        transaction = {
+            "to": OTHER,
+            "data": "",
+            "value": 0,
+            "signer": OWNER,
+        }
+
+        with cairo_error("Invalid nonce"):
+            cairo_run(
+                "test_os",
+                block=block([transaction], nonces={OWNER: nonce}),
+                state=State.model_validate(initial_state),
+            )

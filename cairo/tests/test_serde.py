@@ -1,23 +1,14 @@
-from typing import Any, Optional, Tuple, Type, Union
+from typing import Any, Mapping, Optional, Set, Tuple, Type, Union
 
 import pytest
+from ethereum_types.bytes import Bytes, Bytes0, Bytes8, Bytes20, Bytes32, Bytes256
+from ethereum_types.numeric import U64, U256, Uint
 from hypothesis import assume, given, settings
 from starkware.cairo.common.dict import DictManager
 from starkware.cairo.lang.cairo_constants import DEFAULT_PRIME
 from starkware.cairo.lang.vm.memory_dict import MemoryDict
 from starkware.cairo.lang.vm.memory_segments import MemorySegmentManager
 
-from ethereum.base_types import (
-    U64,
-    U256,
-    Bytes,
-    Bytes0,
-    Bytes8,
-    Bytes20,
-    Bytes32,
-    Bytes256,
-    Uint,
-)
 from ethereum.cancun.blocks import Header, Log, Receipt, Withdrawal
 from ethereum.cancun.fork_types import Account, Address, Bloom, Root, VersionedHash
 from ethereum.cancun.transactions import (
@@ -29,6 +20,7 @@ from ethereum.cancun.transactions import (
 )
 from ethereum.cancun.trie import BranchNode, ExtensionNode, InternalNode, LeafNode, Node
 from ethereum.cancun.vm.gas import MessageCallGas
+from ethereum.exceptions import EthereumException
 from tests.utils.args_gen import _cairo_struct_to_python_type
 from tests.utils.args_gen import gen_arg as _gen_arg
 from tests.utils.args_gen import to_cairo_type as _to_cairo_type
@@ -41,13 +33,17 @@ def segments():
 
 
 @pytest.fixture(scope="module")
+def dict_manager():
+    return DictManager()
+
+
+@pytest.fixture(scope="module")
 def serde(cairo_program, segments):
     return Serde(segments, cairo_program)
 
 
 @pytest.fixture(scope="module")
-def gen_arg(segments):
-    dict_manager = DictManager()
+def gen_arg(dict_manager, segments):
     return _gen_arg(dict_manager, segments)
 
 
@@ -60,6 +56,20 @@ def to_cairo_type(cairo_program):
 
 
 def get_type(instance: Any) -> Type:
+    if isinstance(instance, Mapping):
+        # Get key and value types from the first item in the mapping
+        if instance:
+            key_type = get_type(next(iter(instance.keys())))
+            value_type = get_type(next(iter(instance.values())))
+            return Mapping[key_type, value_type]
+        return Mapping
+
+    if isinstance(instance, Set):
+        if instance:
+            item_type = get_type(next(iter(instance)))
+            return Set[item_type]
+        return Set
+
     if not isinstance(instance, tuple):
         return type(instance)
 
@@ -78,19 +88,28 @@ def get_type(instance: Any) -> Type:
     return Tuple[tuple(elem_types)]
 
 
+def is_sequence(value: Any) -> bool:
+    return (
+        isinstance(value, tuple)
+        or isinstance(value, list)
+        or isinstance(value, Mapping)
+        or isinstance(value, Set)
+    )
+
+
 def no_empty_sequence(value: Any) -> bool:
     """Recursively check that no tuples (including nested ones) are empty."""
-    if not isinstance(value, tuple) and not isinstance(value, list):
+    if not is_sequence(value):
         return True
+
+    if isinstance(value, Mapping) or isinstance(value, Set):
+        return len(value) > 0
 
     if not value:  # Empty tuple
         return False
 
     # Check each element recursively if it's a tuple
-    return all(
-        no_empty_sequence(x) if (isinstance(x, tuple) or isinstance(x, list)) else True
-        for x in value
-    )
+    return all(no_empty_sequence(x) if is_sequence(x) else True for x in value)
 
 
 class TestSerde:
@@ -145,6 +164,10 @@ class TestSerde:
             InternalNode,
             Optional[InternalNode],
             Node,
+            Mapping[Bytes, Bytes],
+            Tuple[Mapping[Bytes, Bytes], ...],
+            Set[Uint],
+            Mapping[Address, Account],
         ],
     ):
         assume(no_empty_sequence(b))
@@ -152,3 +175,19 @@ class TestSerde:
         base = segments.gen_arg([gen_arg(type_, b)])
         result = serde.serialize(to_cairo_type(type_), base, shift=0)
         assert result == b
+
+    @given(err=...)
+    def test_exception(
+        self, to_cairo_type, segments, serde, gen_arg, err: Union[EthereumException]
+    ):
+        base = segments.gen_arg([gen_arg(EthereumException, err)])
+
+        with pytest.raises(type(err)) as exception:
+            serde.serialize(to_cairo_type(EthereumException), base, shift=0)
+
+        assert str(exception.value) == str(err)
+
+    def test_none_exception(self, to_cairo_type, serde, gen_arg):
+        base = gen_arg(EthereumException, None)
+        result = serde.serialize(to_cairo_type(EthereumException), base, shift=0)
+        assert result is None
